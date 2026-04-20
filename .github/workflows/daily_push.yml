@@ -1,0 +1,30 @@
+name: Daily Copenhagen Push
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  push-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r wecom-copenhagen-daily-push/requirements.txt
+
+      - name: Run script
+        env:
+          WECOM_CORP_ID: ${{ secrets.WECOM_CORP_ID }}
+          WECOM_CORP_SECRET: ${{ secrets.WECOM_CORP_SECRET }}
+          WECOM_AGENT_ID: ${{ secrets.WECOM_AGENT_ID }}
+          WECOM_TOUSER: ${{ secrets.WECOM_TOUSER }}
+        run: python wecom-copenhagen-daily-push/send_daily_report.py
