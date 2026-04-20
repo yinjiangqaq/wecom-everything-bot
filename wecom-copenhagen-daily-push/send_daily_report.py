@@ -9,6 +9,8 @@ WECOM_CORP_ID = os.getenv("WECOM_CORP_ID", "")
 WECOM_CORP_SECRET = os.getenv("WECOM_CORP_SECRET", "")
 WECOM_AGENT_ID = os.getenv("WECOM_AGENT_ID", "")
 WECOM_TOUSER = os.getenv("WECOM_TOUSER", "")
+WECOM_WEBHOOK_URL = os.getenv("WECOM_WEBHOOK_URL", "")
+WECOM_WEBHOOK_KEY = os.getenv("WECOM_WEBHOOK_KEY", "")
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 HOLIDAY_API_URL = "https://date.nager.at/api/v3/publicholidays/{year}/DK"
@@ -111,6 +113,10 @@ def get_copenhagen_status() -> str:
 
 
 def send_wecom_text(content: str) -> dict:
+    webhook_url = build_wecom_webhook_url()
+    if webhook_url:
+        return send_wecom_webhook_text(content, webhook_url)
+
     if not WECOM_AGENT_ID or not WECOM_TOUSER:
         raise ValueError("缺少 WECOM_AGENT_ID 或 WECOM_TOUSER")
 
@@ -133,6 +139,32 @@ def send_wecom_text(content: str) -> dict:
 
     if data.get("errcode") != 0:
         raise ValueError(f"发送企业微信消息失败: {data}")
+
+    return data
+
+
+def build_wecom_webhook_url() -> str:
+    if WECOM_WEBHOOK_URL:
+        return WECOM_WEBHOOK_URL
+    if WECOM_WEBHOOK_KEY:
+        return f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_WEBHOOK_KEY}"
+    return ""
+
+
+def send_wecom_webhook_text(content: str, webhook_url: str) -> dict:
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": content
+        }
+    }
+
+    resp = requests.post(webhook_url, json=payload, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("errcode") != 0:
+        raise ValueError(f"发送企业微信机器人消息失败: {data}")
 
     return data
 
