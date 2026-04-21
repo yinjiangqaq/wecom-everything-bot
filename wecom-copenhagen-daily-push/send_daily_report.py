@@ -23,6 +23,8 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 HOLIDAY_API_URL = "https://date.nager.at/api/v3/publicholidays/{year}/DK"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+CPHPOST_RSS_URL = "https://cphpost.dk/rss-feed/"
+CPH_POLICE_RSS_URL = "https://via.ritzau.dk/rss/short-messages/latest?publisherId=90685"
 
 COPENHAGEN_LAT = 55.6761
 COPENHAGEN_LON = 12.5683
@@ -37,12 +39,108 @@ REQUEST_HEADERS = {
     )
 }
 
-NEWS_CATEGORY_QUERIES = [
-    ("交通", "Copenhagen traffic OR Copenhagen metro OR Copenhagen train OR Copenhagen road"),
-    ("天气", "Copenhagen weather OR Copenhagen storm OR Copenhagen rain OR Copenhagen climate"),
-    ("节日", "Copenhagen holiday OR Copenhagen festival OR Copenhagen celebration OR Copenhagen event"),
-    ("文化活动", "Copenhagen culture OR Copenhagen museum OR Copenhagen exhibition OR Copenhagen concert"),
-    ("本地", "Copenhagen local news OR Copenhagen city council OR Copenhagen neighborhood"),
+NEWS_CATEGORY_CONFIGS = [
+    {
+        "name": "交通",
+        "queries": [
+            "site:politi.dk Copenhagen traffic OR Copenhagen metro OR Copenhagen train OR Copenhagen road",
+            "site:cphpost.dk Copenhagen traffic OR metro OR rail OR road OR commute",
+        ],
+        "rss_urls": [CPH_POLICE_RSS_URL],
+        "required_keywords": [
+            "traffic",
+            "metro",
+            "train",
+            "rail",
+            "road",
+            "bus",
+            "station",
+            "commute",
+            "transport",
+            "closure",
+            "closed",
+            "delay",
+            "disruption",
+            "accident",
+            "police",
+        ],
+    },
+    {
+        "name": "天气",
+        "queries": [
+            "site:cphpost.dk Copenhagen weather OR storm OR rain OR snow OR wind OR flood",
+            "Copenhagen weather storm rain wind snow flood site:thelocal.dk OR site:cphpost.dk",
+        ],
+        "rss_urls": [],
+        "required_keywords": [
+            "weather",
+            "storm",
+            "rain",
+            "snow",
+            "wind",
+            "flood",
+            "icy",
+            "ice",
+            "temperature",
+            "forecast",
+            "heat",
+            "cold",
+            "climate",
+        ],
+    },
+    {
+        "name": "节日",
+        "queries": [
+            "site:cphpost.dk Copenhagen holiday OR festival OR parade OR celebration",
+            "Copenhagen holiday festival celebration site:visitcopenhagen.com OR site:cphpost.dk",
+        ],
+        "rss_urls": [],
+        "required_keywords": [
+            "holiday",
+            "festival",
+            "parade",
+            "celebration",
+            "easter",
+            "christmas",
+            "public holiday",
+            "tradition",
+            "festive",
+        ],
+    },
+    {
+        "name": "文化活动",
+        "queries": [
+            "site:cphpost.dk Copenhagen museum OR exhibition OR concert OR theatre OR opera OR art",
+            "Copenhagen culture museum exhibition concert theatre opera art site:visitcopenhagen.com OR site:cphpost.dk",
+        ],
+        "rss_urls": [CPHPOST_RSS_URL],
+        "required_keywords": [
+            "culture",
+            "museum",
+            "exhibition",
+            "concert",
+            "theatre",
+            "theater",
+            "opera",
+            "art",
+            "music",
+            "jazz",
+            "film",
+            "cinema",
+            "festival",
+            "event",
+            "performance",
+        ],
+    },
+    {
+        "name": "本地",
+        "queries": [
+            "site:cphpost.dk Copenhagen local news OR city council OR housing OR neighborhood",
+            "Copenhagen local news site:cphpost.dk OR site:international.kk.dk",
+        ],
+        "rss_urls": [CPHPOST_RSS_URL],
+        "required_keywords": [],
+    },
 ]
 
 _translation_cache = {}
@@ -143,6 +241,12 @@ def build_news_rss_url(query: str) -> str:
     return f"{GOOGLE_NEWS_RSS_URL}?{urlencode(params)}"
 
 
+def clean_html_text(text: str) -> str:
+    unescaped = html.unescape(text or "")
+    no_tags = re.sub(r"<[^>]+>", " ", unescaped)
+    return re.sub(r"\s+", " ", no_tags).strip()
+
+
 def strip_title_source(title: str, source: str) -> str:
     if not source:
         return title
@@ -199,17 +303,31 @@ def translate_text_to_zh(text: str) -> str:
     return normalized
 
 
-def fetch_news_items(query: str, seen_titles: set[str]) -> list[dict]:
-    resp = requests.get(
-        build_news_rss_url(query),
-        headers=REQUEST_HEADERS,
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
+def build_item_text(item: dict) -> str:
+    return " ".join(
+        part
+        for part in [
+            item.get("title", ""),
+            item.get("source", ""),
+            item.get("summary", ""),
+        ]
+        if part
+    ).lower()
 
-    root = ElementTree.fromstring(resp.content)
+
+def item_matches_category(item: dict, required_keywords: list[str]) -> bool:
+    if not required_keywords:
+        return True
+    haystack = build_item_text(item)
+    return any(keyword.lower() in haystack for keyword in required_keywords)
+
+
+def news_identity(item: dict) -> str:
+    return normalize_title(item.get("title", ""))
+
+
+def parse_rss_items(root: ElementTree.Element, seen_titles: set[str]) -> list[dict]:
     items = []
-
     for item in root.findall("./channel/item"):
         raw_title = html.unescape(item.findtext("title", default="").strip())
         source = html.unescape(item.findtext("source", default="").strip())
@@ -231,46 +349,99 @@ def fetch_news_items(query: str, seen_titles: set[str]) -> list[dict]:
             {
                 "title": clean_title,
                 "source": source or "Google News",
+                "summary": clean_html_text(item.findtext("description", default="").strip()),
+                "url": item.findtext("link", default="").strip(),
                 "published_at": pub_dt,
             }
         )
-        seen_titles.add(title_key)
-
-        if len(items) >= NEWS_ITEMS_PER_CATEGORY:
-            break
-
     return items
 
 
-def format_news_section() -> str:
-    lines = ["当日新闻："]
-    seen_titles = set()
+def fetch_news_items(query: str, seen_titles: set[str]) -> list[dict]:
+    resp = requests.get(
+        build_news_rss_url(query),
+        headers=REQUEST_HEADERS,
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    root = ElementTree.fromstring(resp.content)
+    return parse_rss_items(root, seen_titles)
 
-    for category_name, query in NEWS_CATEGORY_QUERIES:
+
+def fetch_rss_feed_items(rss_url: str, seen_titles: set[str]) -> list[dict]:
+    resp = requests.get(rss_url, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    root = ElementTree.fromstring(resp.content)
+    return parse_rss_items(root, seen_titles)
+
+
+def collect_category_items(category_config: dict, seen_titles: set[str]) -> list[dict]:
+    candidates = []
+    required_keywords = category_config.get("required_keywords", [])
+
+    for rss_url in category_config.get("rss_urls", []):
+        try:
+            items = fetch_rss_feed_items(rss_url, seen_titles)
+        except (requests.RequestException, ElementTree.ParseError):
+            continue
+        for item in items:
+            item_key = news_identity(item)
+            if item_key in seen_titles or not item_matches_category(item, required_keywords):
+                continue
+            seen_titles.add(item_key)
+            candidates.append(item)
+            if len(candidates) >= NEWS_ITEMS_PER_CATEGORY:
+                return candidates[:NEWS_ITEMS_PER_CATEGORY]
+
+    for query in category_config.get("queries", []):
         try:
             items = fetch_news_items(query, seen_titles)
-        except requests.RequestException:
-            items = []
-        except ElementTree.ParseError:
-            items = []
+        except (requests.RequestException, ElementTree.ParseError):
+            continue
+        for item in items:
+            item_key = news_identity(item)
+            if item_key in seen_titles or not item_matches_category(item, required_keywords):
+                continue
+            seen_titles.add(item_key)
+            candidates.append(item)
+            if len(candidates) >= NEWS_ITEMS_PER_CATEGORY:
+                return candidates[:NEWS_ITEMS_PER_CATEGORY]
 
-        lines.append(f"【{category_name}】")
+    return candidates[:NEWS_ITEMS_PER_CATEGORY]
+
+
+def escape_wecom_markdown(text: str) -> str:
+    return text.replace("[", "\\[").replace("]", "\\]")
+
+
+def format_news_section_markdown() -> str:
+    lines = ["# 当日新闻"]
+    seen_titles = set()
+
+    for category_config in NEWS_CATEGORY_CONFIGS:
+        category_name = category_config["name"]
+        items = collect_category_items(category_config, seen_titles)
+
+        lines.append(f"**{category_name}**")
         if not items:
-            lines.append("- 暂无检索到相关更新")
+            lines.append("- 暂无高相关更新")
             continue
 
         for item in items:
-            translated_title = translate_text_to_zh(item["title"])
+            translated_title = escape_wecom_markdown(translate_text_to_zh(item["title"]))
             time_text = format_news_time(item["published_at"])
             meta = item["source"]
             if time_text:
                 meta = f"{meta}，{time_text}"
-            lines.append(f"- {translated_title}（{meta}）")
+            if item.get("url"):
+                lines.append(f"- [{translated_title}]({item['url']})（{meta}）")
+            else:
+                lines.append(f"- {translated_title}（{meta}）")
 
     return "\n".join(lines)
 
 
-def get_copenhagen_status() -> str:
+def format_daily_report_markdown() -> str:
     dt, current = get_copenhagen_now()
     date_str = dt.strftime("%Y-%m-%d")
     time_str = dt.strftime("%H:%M")
@@ -278,19 +449,22 @@ def get_copenhagen_status() -> str:
     weather_code = current.get("weather_code")
     wind_speed = current.get("wind_speed_10m")
     holiday_text = get_holiday_text(date_str)
-    news_section = format_news_section()
+    news_section = format_news_section_markdown()
 
-    msg = (
-        f"哥本哈根每日播报\n"
-        f"时间：{date_str} {time_str}\n"
-        f"天气：{weather_code_to_text(weather_code)}\n"
-        f"温度：{temp}°C\n"
-        f"风速：{wind_speed} km/h\n"
-        f"今天是否为丹麦公共假期：{holiday_text}\n"
+    return (
+        f"# 哥本哈根每日播报\n"
+        f"> 时间：{date_str} {time_str}\n"
+        f"> 天气：{weather_code_to_text(weather_code)}\n"
+        f"> 温度：{temp}°C\n"
+        f"> 风速：{wind_speed} km/h\n"
+        f"> 今天是否为丹麦公共假期：{holiday_text}\n"
         f"\n"
         f"{news_section}"
     )
-    return msg
+
+
+def get_copenhagen_status() -> str:
+    return format_daily_report_markdown()
 
 
 def send_wecom_text(content: str) -> dict:
@@ -306,9 +480,9 @@ def send_wecom_text(content: str) -> dict:
 
     payload = {
         "touser": WECOM_TOUSER,
-        "msgtype": "text",
+        "msgtype": "markdown",
         "agentid": int(WECOM_AGENT_ID),
-        "text": {"content": content},
+        "markdown": {"content": content},
         "safe": 0,
     }
 
@@ -331,7 +505,7 @@ def build_wecom_webhook_url() -> str:
 
 
 def send_wecom_webhook_text(content: str, webhook_url: str) -> dict:
-    payload = {"msgtype": "text", "text": {"content": content}}
+    payload = {"msgtype": "markdown", "markdown": {"content": content}}
 
     resp = requests.post(webhook_url, json=payload, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
