@@ -1,4 +1,5 @@
 import html
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -25,12 +26,45 @@ GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 CPHPOST_RSS_URL = "https://cphpost.dk/rss-feed/"
 CPH_POLICE_RSS_URL = "https://via.ritzau.dk/rss/short-messages/latest?publisherId=90685"
+TOO_GOOD_TO_GO_URL = "https://www.toogoodtogo.com/"
+ETILBUDSAVIS_URL = "https://etilbudsavis.dk/"
+MINETILBUD_URL = "https://minetilbud.dk/"
+MATAS_HAND_SANITIZER_URL = "https://www.matas.dk/medicin-pleje/hygiejne/haandsprit"
+UNGDOMSKORT_URL = "https://ungdomskort.dk/english"
+DSB_ORANGE_URL = "https://www.dsb.dk/en/find-produkter-og-services/orange/"
+DSB_ORANGE_FRI_URL = "https://www.dsb.dk/en/tickets-and-services/orange-fri/"
+REJSEKORT_IMPORTANT_DATES_URL = "https://www.rejsekort.dk/en/luk/Vigtige-datoer/Vigtige-datoer"
+REJSEPLANEN_APP_URL = "https://help.rejseplanen.dk/hc/en-us/articles/115002672449-Rejseplanen-s-app"
 
 COPENHAGEN_LAT = 55.6761
 COPENHAGEN_LON = 12.5683
 COPENHAGEN_TZ = "Europe/Copenhagen"
 HTTP_TIMEOUT = 15
 NEWS_ITEMS_PER_CATEGORY = int(os.getenv("NEWS_ITEMS_PER_CATEGORY", "1"))
+LIFE_INFO_ENABLED = os.getenv("LIFE_INFO_ENABLED", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+LIFE_REFERENCE_ITEM_LIMIT = int(os.getenv("LIFE_REFERENCE_ITEM_LIMIT", "2"))
+WECOM_TEXT_MAX_CHARS = int(os.getenv("WECOM_TEXT_MAX_CHARS", "1800"))
+
+KU_PHARMACY_CAMPUS = {
+    "name": "KU 药学院 / Department of Pharmacy",
+    "address": "Universitetsparken 2, 2100 København Ø",
+    "reception_address": "Jagtvej 160, Building 22, 2100 Copenhagen Ø",
+    "nearby_bus_lines": ["8A", "42", "184", "185", "15E", "150S"],
+}
+
+LIFE_STAPLE_SEARCHES = [
+    ("håndsprit", "消毒/免洗洗手液"),
+    ("vaskemiddel", "洗衣液"),
+    ("toiletpapir", "厕纸/纸巾"),
+    ("opvaskemiddel", "洗洁精"),
+    ("rugbrød", "黑麦面包"),
+    ("brød", "面包"),
+]
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -320,6 +354,233 @@ def clean_html_text(text: str) -> str:
     return re.sub(r"\s+", " ", no_tags).strip()
 
 
+def clean_json_string(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return html.unescape(value)
+
+
+def build_maps_search_url(query: str) -> str:
+    params = {"api": "1", "query": query}
+    return f"https://www.google.com/maps/search/?{urlencode(params)}"
+
+
+def parse_dkk_price(price_text: str) -> float:
+    number_match = re.search(r"\d+(?:[.,]\d+)?", price_text)
+    if not number_match:
+        return 10**9
+    return float(number_match.group(0).replace(".", "").replace(",", "."))
+
+
+def dedupe_preserving_order(values) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = normalize_title(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value.strip())
+    return result
+
+
+def collapse_repeated_product_name(name: str) -> str:
+    words = name.split()
+    if len(words) < 4 or len(words) % 2:
+        return name
+    half = len(words) // 2
+    if words[:half] == words[half:]:
+        return " ".join(words[:half])
+    return name
+
+
+def clean_product_name(name: str) -> str:
+    cleaned = re.sub(r"\b\d+\s*(?:stk|ml|l|g|kg|produkter)\b", " ", name, flags=re.I)
+    cleaned = re.sub(
+        r"\b(?:filtre|mærker|indhold|certificeringer|sortering|mest populære|se alle)\b",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    cleaned = collapse_repeated_product_name(cleaned)
+    if len(cleaned) > 90:
+        cleaned = cleaned[-90:].strip(" -")
+    if len(cleaned) < 5:
+        return ""
+    if any(
+        noise in cleaned.lower()
+        for noise in [
+            "hurtig levering",
+            "betalingsmuligheder",
+            "find receptmedicin",
+            "klub matas",
+        ]
+    ):
+        return ""
+    return cleaned
+
+
+def fetch_matas_hand_sanitizer_examples(limit: int) -> list[dict]:
+    try:
+        resp = requests.get(
+            MATAS_HAND_SANITIZER_URL,
+            headers=REQUEST_HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return []
+
+    page_text = clean_html_text(resp.text)
+    fragments = re.split(r"Image:\s*", page_text)
+    items = []
+
+    for fragment in fragments:
+        if "Pris:" not in fragment:
+            continue
+        price_match = re.search(r"Pris:\s*([0-9]+(?:[.,][0-9]{2})?\s*kr\.?)", fragment)
+        if not price_match:
+            continue
+
+        name = clean_product_name(fragment[: price_match.start()])
+        if not name:
+            continue
+
+        items.append(
+            {
+                "name": name,
+                "price": price_match.group(1).replace(" ", ""),
+                "source": "Matas",
+                "url": MATAS_HAND_SANITIZER_URL,
+            }
+        )
+
+    unique_items = []
+    seen = set()
+    for item in sorted(items, key=lambda item: parse_dkk_price(item["price"])):
+        key = normalize_title(f"{item['name']} {item['price']}")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_items.append(item)
+        if len(unique_items) >= limit:
+            break
+
+    return unique_items
+
+
+def fetch_etilbudsavis_top_searches(limit: int) -> list[str]:
+    try:
+        resp = requests.get(ETILBUDSAVIS_URL, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return []
+
+    raw_titles = re.findall(
+        r'"title"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"search_query"',
+        resp.text,
+    )
+    titles = dedupe_preserving_order(clean_json_string(title) for title in raw_titles)
+    return titles[:limit]
+
+
+def format_campus_life_header() -> list[str]:
+    return [
+        "留学生活情报（KU 药学院附近）：",
+        (
+            f"定位：{KU_PHARMACY_CAMPUS['address']}；公交关注 "
+            f"{'/'.join(KU_PHARMACY_CAMPUS['nearby_bus_lines'])}"
+        ),
+    ]
+
+
+def format_bakery_discount_section() -> list[str]:
+    campus_query = f"bakery near {KU_PHARMACY_CAMPUS['address']}"
+    return [
+        "【面包/临期食品】",
+        (
+            "- Too Good To Go：把位置设为 Universitetsparken 2，收藏 Østerbro / "
+            "Nørrebro 面包店和咖啡店，晚间/关门前更容易刷到 surprise bag。"
+        ),
+        f"  入口：{TOO_GOOD_TO_GO_URL}",
+        f"  地图查附近面包店：{build_maps_search_url(campus_query)}",
+    ]
+
+
+def format_life_goods_section() -> list[str]:
+    lines = ["【生活用品/比价】"]
+
+    matas_items = fetch_matas_hand_sanitizer_examples(LIFE_REFERENCE_ITEM_LIMIT)
+    if matas_items:
+        examples = "；".join(
+            f"{item['name']} {item['price']}" for item in matas_items
+        )
+        lines.append(f"- Matas 消毒用品参考低价：{examples}")
+    else:
+        lines.append("- 消毒/免洗洗手液：优先查 Matas、Normal、Netto、Lidl 的当周优惠。")
+
+    top_searches = fetch_etilbudsavis_top_searches(12)
+    staple_terms = {query for query, _label in LIFE_STAPLE_SEARCHES}
+    relevant_searches = [
+        title for title in top_searches if normalize_title(title) in staple_terms
+    ]
+    if relevant_searches:
+        lines.append(f"- eTilbudsavis 近期热搜：{' / '.join(relevant_searches[:4])}")
+
+    tracked_labels = "、".join(
+        f"{label}({query})" for query, label in LIFE_STAPLE_SEARCHES
+    )
+    lines.append(f"- 本周建议查：{tracked_labels}")
+    lines.append(f"  eTilbudsavis：{ETILBUDSAVIS_URL}")
+    lines.append(f"  MineTilbud：{MINETILBUD_URL}")
+    lines.append(
+        "  附近日用品地图："
+        + build_maps_search_url(f"Normal Matas Netto Lidl near {KU_PHARMACY_CAMPUS['address']}")
+    )
+    return lines
+
+
+def format_transport_saving_section(now: datetime) -> list[str]:
+    lines = ["【交通省钱】"]
+    lines.append(
+        "- 上学通勤：先用 Rejseplanen 算住址到 Universitetsparken 2 的区数；"
+        "每天跨区通勤再比较 Ungdomskort/通勤卡，偶尔出行用 Rejsekort app 或 Rejsebillet。"
+    )
+    lines.append(f"  Ungdomskort：{UNGDOMSKORT_URL}")
+    lines.append(f"  Rejseplanen：{REJSEPLANEN_APP_URL}")
+    lines.append(
+        "- 城际旅行：提前查 DSB Orange；行程可能变动时优先看 Orange Fri，"
+        "通常比临时买标准票更省。"
+    )
+    lines.append(f"  DSB Orange：{DSB_ORANGE_URL}")
+    lines.append(f"  Orange Fri：{DSB_ORANGE_FRI_URL}")
+
+    rejsekort_close_date = datetime(2026, 5, 29, tzinfo=now.tzinfo).date()
+    if now.date() <= rejsekort_close_date:
+        lines.append(
+            "- Rejsekort 提醒：实体卡系统 2026-05-29 关闭，别在旧卡里留太多余额，"
+            "优先迁到 Rejsekort app。"
+        )
+    else:
+        lines.append("- Rejsekort 提醒：旧实体卡系统已关闭，优先使用 Rejsekort app / Rejsebillet。")
+    lines.append(f"  重要日期：{REJSEKORT_IMPORTANT_DATES_URL}")
+    return lines
+
+
+def format_student_life_section_text(now: datetime) -> str:
+    if not LIFE_INFO_ENABLED:
+        return ""
+
+    lines = []
+    lines.extend(format_campus_life_header())
+    lines.extend(format_bakery_discount_section())
+    lines.extend(format_life_goods_section())
+    lines.extend(format_transport_saving_section(now))
+    return "\n".join(lines)
+
+
 def strip_title_source(title: str, source: str) -> str:
     if not source:
         return title
@@ -569,51 +830,101 @@ def format_daily_report_text() -> str:
     weather_code = current.get("weather_code")
     wind_speed = current.get("wind_speed_10m")
     holiday_text = get_holiday_text(date_str)
+    life_section = format_student_life_section_text(dt)
     news_section = format_news_section_text()
 
-    return (
+    base_text = (
         f"哥本哈根每日播报\n"
         f"时间：{date_str} {time_str}\n"
         f"天气：{weather_code_to_text(weather_code)}\n"
         f"温度：{temp}°C\n"
         f"风速：{wind_speed} km/h\n"
-        f"今天是否为丹麦公共假期：{holiday_text}\n"
-        f"\n"
-        f"{news_section}"
+        f"今天是否为丹麦公共假期：{holiday_text}"
     )
+    sections = [base_text]
+    if life_section:
+        sections.append(life_section)
+    sections.append(news_section)
+    return "\n\n".join(sections)
 
 
 def get_copenhagen_status() -> str:
     return format_daily_report_text()
 
 
+def split_wecom_text(content: str) -> list[str]:
+    if len(content) <= WECOM_TEXT_MAX_CHARS:
+        return [content]
+
+    chunk_limit = max(100, WECOM_TEXT_MAX_CHARS - 16)
+    chunks = []
+    current_lines = []
+    current_length = 0
+
+    for line in content.splitlines():
+        line_length = len(line) + 1
+        if current_lines and current_length + line_length > chunk_limit:
+            chunks.append("\n".join(current_lines))
+            current_lines = []
+            current_length = 0
+
+        if line_length > chunk_limit:
+            for start in range(0, len(line), chunk_limit):
+                part = line[start : start + chunk_limit]
+                if current_lines:
+                    chunks.append("\n".join(current_lines))
+                    current_lines = []
+                    current_length = 0
+                chunks.append(part)
+            continue
+
+        current_lines.append(line)
+        current_length += line_length
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    if len(chunks) <= 1:
+        return chunks
+
+    return [f"({index + 1}/{len(chunks)})\n{chunk}" for index, chunk in enumerate(chunks)]
+
+
 def send_wecom_text(content: str) -> dict:
+    chunks = split_wecom_text(content)
     webhook_url = build_wecom_webhook_url()
     if webhook_url:
-        return send_wecom_webhook_text(content, webhook_url)
+        result = {}
+        for chunk in chunks:
+            result = send_wecom_webhook_text(chunk, webhook_url)
+        return result
 
     if not WECOM_AGENT_ID or not WECOM_TOUSER:
         raise ValueError("缺少 WECOM_AGENT_ID 或 WECOM_TOUSER")
 
     access_token = get_access_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}"
+    result = {}
 
-    payload = {
-        "touser": WECOM_TOUSER,
-        "msgtype": "text",
-        "agentid": int(WECOM_AGENT_ID),
-        "text": {"content": content},
-        "safe": 0,
-    }
+    for chunk in chunks:
+        payload = {
+            "touser": WECOM_TOUSER,
+            "msgtype": "text",
+            "agentid": int(WECOM_AGENT_ID),
+            "text": {"content": chunk},
+            "safe": 0,
+        }
 
-    resp = requests.post(url, json=payload, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
+        resp = requests.post(url, json=payload, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
 
-    if data.get("errcode") != 0:
-        raise ValueError(f"发送企业微信消息失败: {data}")
+        if data.get("errcode") != 0:
+            raise ValueError(f"发送企业微信消息失败: {data}")
 
-    return data
+        result = data
+
+    return result
 
 
 def build_wecom_webhook_url() -> str:
