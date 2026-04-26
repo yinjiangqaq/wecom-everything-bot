@@ -65,9 +65,9 @@ WECOM_TEXT_MAX_CHARS = int(os.getenv("WECOM_TEXT_MAX_CHARS", "1800"))
 
 KU_PHARMACY_CAMPUS = {
     "name": "KU 药学院 / Department of Pharmacy",
-    "address": "Universitetsparken 2, 2100 København Ø",
-    "reception_address": "Jagtvej 160, Building 22, 2100 Copenhagen Ø",
-    "nearby_bus_lines": ["8A", "42", "184", "185", "15E", "150S"],
+    "address": "Dyrlægevej 100, 1870 Frederiksberg C",
+    "reception_address": "Dyrlægevej 100, 1870 Frederiksberg C",
+    "nearby_bus_lines": [],
 }
 
 STUDENT_HOME = {
@@ -77,7 +77,7 @@ STUDENT_HOME = {
 
 DAILY_ROUTE = {
     "summary": f"{STUDENT_HOME['address']} ↔ {KU_PHARMACY_CAMPUS['address']}",
-    "areas": ["Valby", "Frederiksberg", "Nørrebro", "Østerbro"],
+    "areas": ["Valby", "Frederiksberg"],
 }
 
 ROUTE_STORE_RULES = [
@@ -927,7 +927,7 @@ def build_food_decision(now: datetime) -> str:
         time_hint = "明晚 18:30 后"
 
     return (
-        f"{time_hint}可以刷 Too Good To Go；优先看 Valby 住处附近和 KU/Østerbro "
+        f"{time_hint}可以刷 Too Good To Go；优先看 Valby 住处附近和 KU/Frederiksberg "
         "附近面包店，不为便宜专门跨城。"
     )
 
@@ -945,7 +945,7 @@ def build_wellbeing_decision(now: datetime, current: dict) -> str:
         )
     if is_weekend:
         return (
-            "今天适合低成本换环境：Frederiksberg Have / Valbyparken / Fælledparken "
+            "今天适合低成本换环境：Frederiksberg Have / Søndermarken / Valbyparken "
             "任选一个散步 30-60 分钟，缓解无聊和孤独感。"
         )
     return (
@@ -989,11 +989,16 @@ def format_daily_advice_section(
 
 
 def format_campus_life_header() -> list[str]:
+    bus_hint = (
+        f"；公交关注 {'/'.join(KU_PHARMACY_CAMPUS['nearby_bus_lines'])}"
+        if KU_PHARMACY_CAMPUS["nearby_bus_lines"]
+        else "；通勤路线以 Rejseplanen 当天结果为准"
+    )
     return [
         "生活参考（按 Valby ↔ KU 两点一线筛选）：",
         (
-            f"学校：{KU_PHARMACY_CAMPUS['address']}；住处：{STUDENT_HOME['address']}；公交关注 "
-            f"{'/'.join(KU_PHARMACY_CAMPUS['nearby_bus_lines'])}"
+            f"学校：{KU_PHARMACY_CAMPUS['address']}；住处：{STUDENT_HOME['address']}"
+            f"{bus_hint}"
         ),
     ]
 
@@ -1003,8 +1008,8 @@ def format_bakery_discount_section() -> list[str]:
     return [
         "【面包/临期食品】",
         (
-            "- Too Good To Go：把位置设为 Universitetsparken 2，收藏 Østerbro / "
-            "Nørrebro 面包店和咖啡店，晚间/关门前更容易刷到 surprise bag。"
+            "- Too Good To Go：把位置设为 Dyrlægevej 100 或 Valby 住处，收藏 "
+            "Frederiksberg / Valby 面包店和咖啡店，晚间/关门前更容易刷到 surprise bag。"
         ),
         f"  入口：{TOO_GOOD_TO_GO_URL}",
         f"  地图查附近面包店：{build_maps_search_url(campus_query)}",
@@ -1050,7 +1055,7 @@ def format_life_goods_section(
 def format_transport_saving_section(now: datetime) -> list[str]:
     lines = ["【交通省钱】"]
     lines.append(
-        "- 上学通勤：先用 Rejseplanen 算住址到 Universitetsparken 2 的区数；"
+        "- 上学通勤：先用 Rejseplanen 算住址到 Dyrlægevej 100 的区数；"
         "每天跨区通勤再比较 Ungdomskort/通勤卡，偶尔出行用 Rejsekort app 或 Rejsebillet。"
     )
     lines.append(f"  Ungdomskort：{UNGDOMSKORT_URL}")
