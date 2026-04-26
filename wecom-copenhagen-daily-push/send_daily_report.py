@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
@@ -28,8 +28,9 @@ CPHPOST_RSS_URL = "https://cphpost.dk/rss-feed/"
 CPH_POLICE_RSS_URL = "https://via.ritzau.dk/rss/short-messages/latest?publisherId=90685"
 TOO_GOOD_TO_GO_URL = "https://www.toogoodtogo.com/"
 ETILBUDSAVIS_URL = "https://etilbudsavis.dk/"
+ETILBUDSAVIS_SEARCH_URL = "https://etilbudsavis.dk/soeg/{query}"
 MINETILBUD_URL = "https://minetilbud.dk/"
-MATAS_HAND_SANITIZER_URL = "https://www.matas.dk/medicin-pleje/hygiejne/haandsprit"
+MATAS_HAND_SANITIZER_URL = "https://www.matas.dk/medicin-pleje/saarpleje/haandsprit"
 UNGDOMSKORT_URL = "https://ungdomskort.dk/english"
 DSB_ORANGE_URL = "https://www.dsb.dk/en/find-produkter-og-services/orange/"
 DSB_ORANGE_FRI_URL = "https://www.dsb.dk/en/tickets-and-services/orange-fri/"
@@ -47,7 +48,19 @@ LIFE_INFO_ENABLED = os.getenv("LIFE_INFO_ENABLED", "1").lower() not in {
     "no",
     "off",
 }
-LIFE_REFERENCE_ITEM_LIMIT = int(os.getenv("LIFE_REFERENCE_ITEM_LIMIT", "2"))
+LIFE_DEAL_ITEMS_PER_QUERY = int(os.getenv("LIFE_DEAL_ITEMS_PER_QUERY", "1"))
+LIFE_MAX_DEAL_ITEMS = int(os.getenv("LIFE_MAX_DEAL_ITEMS", "6"))
+LIFE_PRODUCT_QUERIES_TEXT = os.getenv(
+    "LIFE_PRODUCT_QUERIES",
+    (
+        "håndsprit:消毒/免洗洗手液;"
+        "vaskemiddel:洗衣液;"
+        "toiletpapir:厕纸/纸巾;"
+        "opvaskemiddel:洗洁精;"
+        "rugbrød:黑麦面包;"
+        "brød:面包"
+    ),
+)
 WECOM_TEXT_MAX_CHARS = int(os.getenv("WECOM_TEXT_MAX_CHARS", "1800"))
 
 KU_PHARMACY_CAMPUS = {
@@ -57,13 +70,35 @@ KU_PHARMACY_CAMPUS = {
     "nearby_bus_lines": ["8A", "42", "184", "185", "15E", "150S"],
 }
 
-LIFE_STAPLE_SEARCHES = [
-    ("håndsprit", "消毒/免洗洗手液"),
-    ("vaskemiddel", "洗衣液"),
-    ("toiletpapir", "厕纸/纸巾"),
-    ("opvaskemiddel", "洗洁精"),
-    ("rugbrød", "黑麦面包"),
-    ("brød", "面包"),
+STUDENT_HOME = {
+    "name": "Valby 租房",
+    "address": "Skyttegårdvej 9, 2500 Valby",
+}
+
+DAILY_ROUTE = {
+    "summary": f"{STUDENT_HOME['address']} ↔ {KU_PHARMACY_CAMPUS['address']}",
+    "areas": ["Valby", "Frederiksberg", "Nørrebro", "Østerbro"],
+}
+
+ROUTE_STORE_RULES = [
+    {
+        "keywords": ["rema 1000", "netto", "lidl", "føtex", "foetex", "matas", "normal"],
+        "level": "route",
+        "note": "日常高频店，适合在 Valby/KU/通勤路线上顺手确认",
+        "score": 0,
+    },
+    {
+        "keywords": ["bilka", "meny", "365discount", "365 discount", "coop"],
+        "level": "maybe",
+        "note": "可能有用，但先确认是否顺路",
+        "score": 1,
+    },
+    {
+        "keywords": ["biltema", "calle", "nielsen scan-shop", "scandinavian park"],
+        "level": "skip",
+        "note": "通常不在 Valby ↔ KU 两点一线，不建议专门去",
+        "score": 3,
+    },
 ]
 
 REQUEST_HEADERS = {
@@ -361,9 +396,36 @@ def clean_json_string(value: str) -> str:
         return html.unescape(value)
 
 
+def parse_life_product_queries(raw_text: str) -> list[dict]:
+    queries = []
+    for part in re.split(r"[;\n]+", raw_text):
+        normalized = part.strip()
+        if not normalized:
+            continue
+
+        if ":" in normalized:
+            query, label = normalized.split(":", 1)
+        elif "=" in normalized:
+            query, label = normalized.split("=", 1)
+        else:
+            query, label = normalized, normalized
+
+        query = query.strip()
+        label = label.strip() or query
+        if query:
+            queries.append({"query": query, "label": label})
+
+    return queries
+
+
 def build_maps_search_url(query: str) -> str:
     params = {"api": "1", "query": query}
     return f"https://www.google.com/maps/search/?{urlencode(params)}"
+
+
+def build_etilbudsavis_search_url(query: str) -> str:
+    query_slug = quote(query.replace(" ", "-"), safe="")
+    return ETILBUDSAVIS_SEARCH_URL.format(query=query_slug)
 
 
 def parse_dkk_price(price_text: str) -> float:
@@ -371,6 +433,52 @@ def parse_dkk_price(price_text: str) -> float:
     if not number_match:
         return 10**9
     return float(number_match.group(0).replace(".", "").replace(",", "."))
+
+
+def format_dkk_price(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return f"{int(value)} kr"
+        return f"{float(value):.2f}".replace(".", ",") + " kr"
+    text = str(value).strip()
+    if not text:
+        return ""
+    if "kr" in text.lower():
+        return text
+    return f"{text} kr"
+
+
+def parse_offer_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+
+    normalized = value.strip().replace("Z", "+00:00")
+    if re.search(r"[+-]\d{4}$", normalized):
+        normalized = f"{normalized[:-5]}{normalized[-5:-2]}:{normalized[-2:]}"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo:
+        return parsed.astimezone(LOCAL_NEWS_TZ)
+    return parsed.replace(tzinfo=LOCAL_NEWS_TZ)
+
+
+def format_offer_valid_until(valid_until: datetime | None) -> str:
+    if not valid_until:
+        return ""
+    return valid_until.strftime("%m-%d")
+
+
+def safe_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def dedupe_preserving_order(values) -> list[str]:
@@ -420,6 +528,265 @@ def clean_product_name(name: str) -> str:
     ):
         return ""
     return cleaned
+
+
+def extract_embedded_json_objects(page_text: str) -> list[dict]:
+    normalized_text = html.unescape(page_text)
+    decoder = json.JSONDecoder()
+    objects = []
+
+    json_ld_scripts = re.findall(
+        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        normalized_text,
+        flags=re.I | re.S,
+    )
+    for script in json_ld_scripts:
+        try:
+            obj = json.loads(script.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        elif isinstance(obj, list):
+            objects.extend(item for item in obj if isinstance(item, dict))
+
+    search_start = 0
+
+    while True:
+        start = normalized_text.find('{"data"', search_start)
+        if start < 0:
+            break
+
+        try:
+            obj, end = decoder.raw_decode(normalized_text[start:])
+        except json.JSONDecodeError:
+            search_start = start + 1
+            continue
+
+        if isinstance(obj, dict):
+            objects.append(obj)
+        search_start = start + end
+
+    return objects
+
+
+def normalize_offer_item(raw_item: dict, label: str, query: str, source_url: str) -> dict | None:
+    if not isinstance(raw_item, dict):
+        return None
+
+    name = (
+        raw_item.get("heading")
+        or raw_item.get("name")
+        or raw_item.get("title")
+        or raw_item.get("description")
+        or ""
+    )
+    name = clean_html_text(str(name))
+    if not name:
+        return None
+
+    pricing = raw_item.get("pricing") or {}
+    if not isinstance(pricing, dict):
+        pricing = {}
+    price = (
+        raw_item.get("price")
+        or pricing.get("price")
+        or pricing.get("amount")
+        or raw_item.get("offerPrice")
+        or raw_item.get("currentPrice")
+        or ""
+    )
+    price_text = format_dkk_price(price)
+    if not price_text:
+        return None
+
+    shop = (
+        raw_item.get("business")
+        or raw_item.get("store")
+        or raw_item.get("dealer")
+        or raw_item.get("seller")
+        or {}
+    )
+    if isinstance(shop, dict):
+        shop_name = shop.get("name") or shop.get("title") or ""
+    else:
+        shop_name = str(shop)
+    shop_name = clean_html_text(shop_name) or "eTilbudsavis"
+
+    valid_until = parse_offer_datetime(
+        str(
+            raw_item.get("validUntil")
+            or raw_item.get("validTo")
+            or raw_item.get("validTill")
+            or raw_item.get("runTill")
+            or raw_item.get("priceValidUntil")
+            or raw_item.get("validThrough")
+            or ""
+        )
+    )
+    now = datetime.now(LOCAL_NEWS_TZ)
+    if valid_until and valid_until < now:
+        return None
+
+    return {
+        "label": label,
+        "query": query,
+        "name": name,
+        "price": price_text,
+        "price_value": parse_dkk_price(price_text),
+        "shop": shop_name,
+        "valid_until": valid_until,
+        "url": raw_item.get("url") or source_url,
+    }
+
+
+def collect_offer_items_from_json(
+    obj,
+    label: str,
+    query: str,
+    source_url: str,
+) -> list[dict]:
+    offers = []
+    if isinstance(obj, list):
+        for item in obj:
+            offers.extend(collect_offer_items_from_json(item, label, query, source_url))
+        return offers
+
+    if not isinstance(obj, dict):
+        return offers
+
+    normalized_offer = normalize_offer_item(obj, label, query, source_url)
+    if normalized_offer:
+        offers.append(normalized_offer)
+
+    for value in obj.values():
+        if isinstance(value, (dict, list)):
+            offers.extend(collect_offer_items_from_json(value, label, query, source_url))
+
+    return offers
+
+
+def fetch_etilbudsavis_offer_items(query: str, label: str, limit: int) -> list[dict]:
+    search_url = build_etilbudsavis_search_url(query)
+    try:
+        resp = requests.get(search_url, headers=REQUEST_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return []
+
+    offers = []
+    for obj in extract_embedded_json_objects(resp.text):
+        offers.extend(collect_offer_items_from_json(obj, label, query, search_url))
+
+    unique_offers = []
+    seen = set()
+    for offer in sorted(
+        offers,
+        key=lambda item: (item["price_value"], item["shop"], item["name"]),
+    ):
+        key = normalize_title(
+            f"{offer['label']} {offer['shop']} {offer['name']} {offer['price']}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_offers.append(offer)
+        if len(unique_offers) >= limit:
+            break
+
+    return unique_offers
+
+
+def fetch_matas_hand_sanitizer_deals(label: str, limit: int) -> list[dict]:
+    deals = []
+    for item in fetch_matas_hand_sanitizer_examples(limit):
+        deals.append(
+            {
+                "label": label,
+                "query": "håndsprit",
+                "name": item["name"],
+                "price": item["price"],
+                "price_value": parse_dkk_price(item["price"]),
+                "shop": item["source"],
+                "valid_until": None,
+                "url": item["url"],
+            }
+        )
+    return deals
+
+
+def collect_life_deal_items() -> tuple[list[dict], list[dict]]:
+    product_queries = parse_life_product_queries(LIFE_PRODUCT_QUERIES_TEXT)
+    deal_items = []
+
+    for config in product_queries:
+        query = config["query"]
+        label = config["label"]
+        items = fetch_etilbudsavis_offer_items(query, label, LIFE_DEAL_ITEMS_PER_QUERY)
+
+        if not items and contains_any_keyword(
+            query.lower(),
+            ["håndsprit", "haandsprit", "desinfektion"],
+        ):
+            items = fetch_matas_hand_sanitizer_deals(label, LIFE_DEAL_ITEMS_PER_QUERY)
+
+        deal_items.extend(items)
+        if len(deal_items) >= LIFE_MAX_DEAL_ITEMS:
+            break
+
+    return deal_items[:LIFE_MAX_DEAL_ITEMS], product_queries
+
+
+def format_life_deal_item(item: dict) -> str:
+    valid_text = format_offer_valid_until(item.get("valid_until"))
+    route_info = classify_store_for_route(item.get("shop", ""))
+    meta_parts = [item["shop"], item["price"]]
+    if valid_text:
+        meta_parts.append(f"至 {valid_text}")
+    if route_info["level"] == "skip":
+        meta_parts.append("不建议专门去")
+    elif route_info["level"] == "route":
+        meta_parts.append("可顺路确认")
+    return f"- {item['label']}：{item['name']}（{'，'.join(meta_parts)}）"
+
+
+def classify_store_for_route(shop_name: str) -> dict:
+    normalized = normalize_title(shop_name)
+    for rule in ROUTE_STORE_RULES:
+        if any(keyword in normalized for keyword in rule["keywords"]):
+            return rule
+    return {
+        "level": "unknown",
+        "note": "未确认是否在 Valby ↔ KU 两点一线，先看链接再决定",
+        "score": 2,
+    }
+
+
+def actionability_score(item: dict) -> tuple[int, float, str]:
+    route_info = classify_store_for_route(item.get("shop", ""))
+    return (
+        route_info["score"],
+        item.get("price_value", 10**9),
+        normalize_title(item.get("label", "")),
+    )
+
+
+def select_route_worthy_deals(deal_items: list[dict], limit: int = 2) -> list[dict]:
+    candidates = [
+        item
+        for item in deal_items
+        if classify_store_for_route(item.get("shop", ""))["level"] in {"route", "maybe"}
+    ]
+    return sorted(candidates, key=actionability_score)[:limit]
+
+
+def select_skip_deals(deal_items: list[dict], limit: int = 2) -> list[dict]:
+    candidates = [
+        item
+        for item in deal_items
+        if classify_store_for_route(item.get("shop", ""))["level"] == "skip"
+    ]
+    return sorted(candidates, key=actionability_score)[:limit]
 
 
 def fetch_matas_hand_sanitizer_examples(limit: int) -> list[dict]:
@@ -486,11 +853,146 @@ def fetch_etilbudsavis_top_searches(limit: int) -> list[str]:
     return titles[:limit]
 
 
+def build_weather_decision(current: dict) -> str:
+    temp = safe_float(current.get("temperature_2m"))
+    wind_speed = safe_float(current.get("wind_speed_10m"))
+    weather_code = current.get("weather_code")
+    weather_text = weather_code_to_text(weather_code)
+
+    clothing_parts = []
+    if temp is None:
+        clothing_parts.append("按体感备外套")
+    elif temp < 5:
+        clothing_parts.append("很冷，羽绒/厚外套和围巾更稳")
+    elif temp < 12:
+        clothing_parts.append("早晚偏冷，带外套")
+    elif temp < 18:
+        clothing_parts.append("薄外套够用")
+    else:
+        clothing_parts.append("穿轻便一点即可")
+
+    if weather_code in {51, 53, 55, 61, 63, 65, 80, 81, 82, 95}:
+        clothing_parts.append("带伞或防水外套")
+    if wind_speed is not None and wind_speed >= 25:
+        clothing_parts.append("风大，骑车注意")
+
+    return f"天气{weather_text}，{format_temperature_for_advice(temp)}；{'，'.join(clothing_parts)}。"
+
+
+def format_temperature_for_advice(temp: float | None) -> str:
+    if temp is None:
+        return "温度未知"
+    return f"{temp:g}°C"
+
+
+def build_holiday_decision(holiday_text: str) -> str:
+    if holiday_text.startswith("是"):
+        return f"今天是丹麦公共假期（{holiday_text.removeprefix('是，')}），出门前确认超市/药店营业时间。"
+    return "今天不是丹麦公共假期，学校、超市和药店大概率正常营业。"
+
+
+def build_procurement_decision(deal_items: list[dict]) -> str:
+    route_worthy_deals = select_route_worthy_deals(deal_items)
+    skip_deals = select_skip_deals(deal_items)
+
+    if not route_worthy_deals:
+        if skip_deals:
+            ignored = "、".join(
+                f"{item['label']}({item['shop']})" for item in skip_deals
+            )
+            return (
+                "今天不建议专门采购；抓到的低价主要不在 Valby ↔ KU 两点一线，"
+                f"例如 {ignored}，除非本来要路过。"
+            )
+        return "今天不建议专门采购；暂时没有抓到明显值得顺路买的生活用品。"
+
+    first_deal = route_worthy_deals[0]
+    extra = ""
+    if len(route_worthy_deals) > 1:
+        other_labels = "、".join(item["label"] for item in route_worthy_deals[1:])
+        extra = f"；同店/同路线还可看 {other_labels}"
+
+    return (
+        f"今天不需要大采购；如果路过 {first_deal['shop']}，"
+        f"可顺手看 {first_deal['label']}（{first_deal['price']}）{extra}。"
+    )
+
+
+def build_food_decision(now: datetime) -> str:
+    if now.hour < 17:
+        time_hint = "晚上 18:30 后"
+    elif now.hour < 21:
+        time_hint = "现在到关门前"
+    else:
+        time_hint = "明晚 18:30 后"
+
+    return (
+        f"{time_hint}可以刷 Too Good To Go；优先看 Valby 住处附近和 KU/Østerbro "
+        "附近面包店，不为便宜专门跨城。"
+    )
+
+
+def build_wellbeing_decision(now: datetime, current: dict) -> str:
+    temp = safe_float(current.get("temperature_2m"))
+    weather_code = current.get("weather_code")
+    is_rainy = weather_code in {51, 53, 55, 61, 63, 65, 80, 81, 82, 95}
+    is_weekend = now.weekday() >= 5
+
+    if is_rainy or (temp is not None and temp < 4):
+        return (
+            "今天适合安排一个低成本室内出口：KU 图书馆、学校自习区，"
+            "或回 Valby 后做一顿热饭，别把晚上完全留给刷手机。"
+        )
+    if is_weekend:
+        return (
+            "今天适合低成本换环境：Frederiksberg Have / Valbyparken / Fælledparken "
+            "任选一个散步 30-60 分钟，缓解无聊和孤独感。"
+        )
+    return (
+        "课后如果还有精力，建议在回 Valby 前顺路散步 20 分钟或逛一次常去超市；"
+        "目标是换环境，不是强行消费。"
+    )
+
+
+def build_transport_decision(now: datetime) -> str:
+    rejsekort_close_date = datetime(2026, 5, 29, tzinfo=now.tzinfo).date()
+    days_left = (rejsekort_close_date - now.date()).days
+    if days_left >= 0:
+        return (
+            f"本周提醒：实体 Rejsekort 系统 2026-05-29 关闭，还剩 {days_left} 天；"
+            "如果还在用旧卡，别留太多余额，优先迁到 Rejsekort app。"
+        )
+    return "交通提醒：实体 Rejsekort 系统已关闭，日常优先使用 Rejsekort app / Rejsebillet。"
+
+
+def format_daily_advice_section(
+    now: datetime,
+    current: dict,
+    holiday_text: str,
+    deal_items: list[dict],
+) -> list[str]:
+    advice_items = [
+        build_weather_decision(current),
+        build_holiday_decision(holiday_text),
+        build_procurement_decision(deal_items),
+        build_food_decision(now),
+        build_wellbeing_decision(now, current),
+        build_transport_decision(now),
+    ]
+
+    lines = [
+        "今日建议：",
+        f"活动范围：{DAILY_ROUTE['summary']}",
+    ]
+    lines.extend(f"{index}. {text}" for index, text in enumerate(advice_items, 1))
+    return lines
+
+
 def format_campus_life_header() -> list[str]:
     return [
-        "留学生活情报（KU 药学院附近）：",
+        "生活参考（按 Valby ↔ KU 两点一线筛选）：",
         (
-            f"定位：{KU_PHARMACY_CAMPUS['address']}；公交关注 "
+            f"学校：{KU_PHARMACY_CAMPUS['address']}；住处：{STUDENT_HOME['address']}；公交关注 "
             f"{'/'.join(KU_PHARMACY_CAMPUS['nearby_bus_lines'])}"
         ),
     ]
@@ -509,30 +1011,33 @@ def format_bakery_discount_section() -> list[str]:
     ]
 
 
-def format_life_goods_section() -> list[str]:
-    lines = ["【生活用品/比价】"]
+def format_life_goods_section(
+    deal_items: list[dict] | None = None,
+    product_queries: list[dict] | None = None,
+) -> list[str]:
+    lines = ["【生活用品实时优惠】"]
+    if deal_items is None or product_queries is None:
+        deal_items, product_queries = collect_life_deal_items()
 
-    matas_items = fetch_matas_hand_sanitizer_examples(LIFE_REFERENCE_ITEM_LIMIT)
-    if matas_items:
-        examples = "；".join(
-            f"{item['name']} {item['price']}" for item in matas_items
-        )
-        lines.append(f"- Matas 消毒用品参考低价：{examples}")
+    if deal_items:
+        for item in deal_items:
+            lines.append(format_life_deal_item(item))
+            lines.append(f"  链接：{item['url']}")
     else:
-        lines.append("- 消毒/免洗洗手液：优先查 Matas、Normal、Netto、Lidl 的当周优惠。")
+        lines.append("- 暂未抓到当前有效优惠；下面保留实时搜索入口。")
 
     top_searches = fetch_etilbudsavis_top_searches(12)
-    staple_terms = {query for query, _label in LIFE_STAPLE_SEARCHES}
+    tracked_queries = {normalize_title(config["query"]) for config in product_queries}
     relevant_searches = [
-        title for title in top_searches if normalize_title(title) in staple_terms
+        title for title in top_searches if normalize_title(title) in tracked_queries
     ]
     if relevant_searches:
-        lines.append(f"- eTilbudsavis 近期热搜：{' / '.join(relevant_searches[:4])}")
+        lines.append(f"- eTilbudsavis 近期热搜匹配：{' / '.join(relevant_searches[:4])}")
 
     tracked_labels = "、".join(
-        f"{label}({query})" for query, label in LIFE_STAPLE_SEARCHES
+        f"{config['label']}({config['query']})" for config in product_queries
     )
-    lines.append(f"- 本周建议查：{tracked_labels}")
+    lines.append(f"- 当前关注词：{tracked_labels}")
     lines.append(f"  eTilbudsavis：{ETILBUDSAVIS_URL}")
     lines.append(f"  MineTilbud：{MINETILBUD_URL}")
     lines.append(
@@ -569,14 +1074,21 @@ def format_transport_saving_section(now: datetime) -> list[str]:
     return lines
 
 
-def format_student_life_section_text(now: datetime) -> str:
+def format_student_life_section_text(
+    now: datetime,
+    current: dict,
+    holiday_text: str,
+) -> str:
     if not LIFE_INFO_ENABLED:
         return ""
 
+    deal_items, product_queries = collect_life_deal_items()
     lines = []
+    lines.extend(format_daily_advice_section(now, current, holiday_text, deal_items))
+    lines.append("")
     lines.extend(format_campus_life_header())
     lines.extend(format_bakery_discount_section())
-    lines.extend(format_life_goods_section())
+    lines.extend(format_life_goods_section(deal_items, product_queries))
     lines.extend(format_transport_saving_section(now))
     return "\n".join(lines)
 
@@ -830,7 +1342,7 @@ def format_daily_report_text() -> str:
     weather_code = current.get("weather_code")
     wind_speed = current.get("wind_speed_10m")
     holiday_text = get_holiday_text(date_str)
-    life_section = format_student_life_section_text(dt)
+    life_section = format_student_life_section_text(dt, current, holiday_text)
     news_section = format_news_section_text()
 
     base_text = (
