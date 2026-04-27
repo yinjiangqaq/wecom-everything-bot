@@ -30,4 +30,5 @@ jobs:
           WECOM_CORP_SECRET: ${{ secrets.WECOM_CORP_SECRET }}
           WECOM_AGENT_ID: ${{ secrets.WECOM_AGENT_ID }}
           WECOM_TOUSER: ${{ secrets.WECOM_TOUSER }}
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
         run: python wecom-copenhagen-daily-push/send_daily_report.py
