@@ -2,7 +2,7 @@ import html
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode
 from xml.etree import ElementTree
@@ -36,6 +36,11 @@ DSB_ORANGE_URL = "https://www.dsb.dk/en/find-produkter-og-services/orange/"
 DSB_ORANGE_FRI_URL = "https://www.dsb.dk/en/tickets-and-services/orange-fri/"
 REJSEKORT_IMPORTANT_DATES_URL = "https://www.rejsekort.dk/en/luk/Vigtige-datoer/Vigtige-datoer"
 REJSEPLANEN_APP_URL = "https://help.rejseplanen.dk/hc/en-us/articles/115002672449-Rejseplanen-s-app"
+TEQUILA_SEARCH_URL = "https://tequila-api.kiwi.com/v2/search"
+GOOGLE_FLIGHTS_URL = "https://www.google.com/travel/flights"
+TRAVELPAYOUTS_PRICES_FOR_DATES_URL = (
+    "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+)
 
 COPENHAGEN_LAT = 55.6761
 COPENHAGEN_LON = 12.5683
@@ -62,6 +67,21 @@ LIFE_PRODUCT_QUERIES_TEXT = os.getenv(
     ),
 )
 WECOM_TEXT_MAX_CHARS = int(os.getenv("WECOM_TEXT_MAX_CHARS", "1800"))
+FLIGHT_WATCH_ENABLED = os.getenv("FLIGHT_WATCH_ENABLED", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+TEQUILA_API_KEY = os.getenv("TEQUILA_API_KEY", "")
+TRAVELPAYOUTS_TOKEN = os.getenv("TRAVELPAYOUTS_TOKEN", "")
+FLIGHT_ORIGINS_TEXT = os.getenv("FLIGHT_ORIGINS", "CAN:广州;SZX:深圳;HKG:香港")
+FLIGHT_DESTINATION_TEXT = os.getenv("FLIGHT_DESTINATION", "DXB:迪拜")
+FLIGHT_DEPARTURE_FROM = os.getenv("FLIGHT_DEPARTURE_FROM", "2026-07-25")
+FLIGHT_DEPARTURE_TO = os.getenv("FLIGHT_DEPARTURE_TO", "2026-08-08")
+FLIGHT_STAY_NIGHTS = int(os.getenv("FLIGHT_STAY_NIGHTS", "4"))
+FLIGHT_MAX_RESULTS = int(os.getenv("FLIGHT_MAX_RESULTS", "5"))
+FLIGHT_CURRENCY = os.getenv("FLIGHT_CURRENCY", "CNY")
 
 KU_PHARMACY_CAMPUS = {
     "name": "KU 药学院 / Department of Pharmacy",
@@ -418,6 +438,21 @@ def parse_life_product_queries(raw_text: str) -> list[dict]:
     return queries
 
 
+def parse_labeled_code_list(raw_text: str) -> list[dict]:
+    items = []
+    for item in parse_life_product_queries(raw_text):
+        code = item["query"].upper()
+        items.append({"code": code, "label": item["label"] or code})
+    return items
+
+
+def parse_destination(raw_text: str) -> dict:
+    items = parse_labeled_code_list(raw_text)
+    if items:
+        return items[0]
+    return {"code": "DXB", "label": "迪拜"}
+
+
 def build_maps_search_url(query: str) -> str:
     params = {"api": "1", "query": query}
     return f"https://www.google.com/maps/search/?{urlencode(params)}"
@@ -429,10 +464,27 @@ def build_etilbudsavis_search_url(query: str) -> str:
 
 
 def parse_dkk_price(price_text: str) -> float:
-    number_match = re.search(r"\d+(?:[.,]\d+)?", price_text)
+    number_match = re.search(r"\d[\d.,]*", price_text)
     if not number_match:
         return 10**9
-    return float(number_match.group(0).replace(".", "").replace(",", "."))
+
+    value = number_match.group(0)
+    if "." in value and "," in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
+    elif "," in value:
+        value = value.replace(".", "").replace(",", ".")
+    elif "." in value:
+        parts = value.split(".")
+        if len(parts[-1]) == 3 and len(parts) > 1:
+            value = value.replace(".", "")
+
+    try:
+        return float(value)
+    except ValueError:
+        return 10**9
 
 
 def format_dkk_price(value) -> str:
@@ -1079,6 +1131,308 @@ def format_transport_saving_section(now: datetime) -> list[str]:
     return lines
 
 
+def format_tequila_date(date_str: str) -> str:
+    dt = datetime.fromisoformat(date_str)
+    return dt.strftime("%d/%m/%Y")
+
+
+def parse_datetime_safe(value: str) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def format_flight_date(value: str) -> str:
+    dt = parse_datetime_safe(value)
+    if not dt:
+        return ""
+    return dt.strftime("%m-%d %H:%M")
+
+
+def build_flight_search_url(origin: dict, destination: dict) -> str:
+    return build_flight_search_url_for_dates(
+        origin,
+        destination,
+        datetime.fromisoformat(FLIGHT_DEPARTURE_FROM).date(),
+    )
+
+
+def build_flight_search_url_for_dates(origin: dict, destination: dict, departure_date) -> str:
+    return_date = departure_date + timedelta(days=FLIGHT_STAY_NIGHTS)
+    query = (
+        f"{origin['code']} to {destination['code']} direct flights "
+        f"{departure_date.strftime('%Y-%m-%d')} return {return_date.strftime('%Y-%m-%d')}"
+    )
+    return f"{GOOGLE_FLIGHTS_URL}?{urlencode({'q': query})}"
+
+
+def iter_flight_departure_dates():
+    current = datetime.fromisoformat(FLIGHT_DEPARTURE_FROM).date()
+    end = datetime.fromisoformat(FLIGHT_DEPARTURE_TO).date()
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def normalize_travelpayouts_flight_item(
+    item: dict,
+    origin: dict,
+    destination: dict,
+    departure_date,
+) -> dict | None:
+    price = item.get("price") or item.get("value")
+    if price is None:
+        return None
+
+    departure = item.get("departure_at") or departure_date.isoformat()
+    return_departure = item.get("return_at") or (
+        departure_date + timedelta(days=FLIGHT_STAY_NIGHTS)
+    ).isoformat()
+    airline = item.get("airline") or item.get("airline_code") or "未知航司"
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "price": price,
+        "price_value": parse_dkk_price(str(price)),
+        "currency": FLIGHT_CURRENCY,
+        "departure": departure,
+        "return_departure": return_departure,
+        "nights": FLIGHT_STAY_NIGHTS,
+        "departure_date": departure_date.isoformat(),
+        "return_date": (departure_date + timedelta(days=FLIGHT_STAY_NIGHTS)).isoformat(),
+        "airlines": airline,
+        "booking_url": build_flight_search_url_for_dates(origin, destination, departure_date),
+        "provider": "Travelpayouts/Aviasales 缓存价",
+    }
+
+
+def fetch_travelpayouts_direct_flight_offer(
+    origin: dict,
+    destination: dict,
+    departure_date,
+) -> dict | None:
+    if not TRAVELPAYOUTS_TOKEN:
+        return None
+
+    return_date = departure_date + timedelta(days=FLIGHT_STAY_NIGHTS)
+    params = {
+        "origin": origin["code"],
+        "destination": destination["code"],
+        "departure_at": departure_date.isoformat(),
+        "return_at": return_date.isoformat(),
+        "currency": FLIGHT_CURRENCY.lower(),
+        "sorting": "price",
+        "direct": "true",
+        "one_way": "false",
+        "limit": 1,
+        "token": TRAVELPAYOUTS_TOKEN,
+    }
+
+    try:
+        resp = requests.get(
+            TRAVELPAYOUTS_PRICES_FOR_DATES_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        return None
+    except ValueError:
+        return None
+
+    offers = data.get("data") or []
+    for item in offers:
+        normalized = normalize_travelpayouts_flight_item(
+            item,
+            origin,
+            destination,
+            departure_date,
+        )
+        if normalized:
+            return normalized
+    return None
+
+
+def fetch_travelpayouts_direct_flight_deals_for_origin(
+    origin: dict,
+    destination: dict,
+) -> list[dict]:
+    deals = []
+    for departure_date in iter_flight_departure_dates():
+        offer = fetch_travelpayouts_direct_flight_offer(
+            origin,
+            destination,
+            departure_date,
+        )
+        if offer:
+            deals.append(offer)
+    return deals
+
+
+def find_return_departure(route: list[dict], destination_code: str) -> str:
+    for segment in route:
+        if segment.get("return") == 1:
+            return segment.get("local_departure", "")
+    for segment in route:
+        if segment.get("flyFrom") == destination_code:
+            return segment.get("local_departure", "")
+    return ""
+
+
+def normalize_flight_item(item: dict, origin: dict, destination: dict) -> dict:
+    route = item.get("route") or []
+    return_departure = find_return_departure(route, destination["code"])
+    airlines = item.get("airlines") or []
+    return {
+        "origin": origin,
+        "destination": destination,
+        "price": item.get("price"),
+        "currency": FLIGHT_CURRENCY,
+        "departure": item.get("local_departure", ""),
+        "return_departure": return_departure,
+        "nights": item.get("nightsInDest") or FLIGHT_STAY_NIGHTS,
+        "airlines": "/".join(airlines) if airlines else "未知航司",
+        "booking_url": item.get("deep_link", ""),
+        "provider": "Kiwi Tequila",
+    }
+
+
+def fetch_direct_flight_deals_for_origin(origin: dict, destination: dict) -> list[dict]:
+    if not TEQUILA_API_KEY:
+        return []
+
+    params = {
+        "fly_from": origin["code"],
+        "fly_to": destination["code"],
+        "date_from": format_tequila_date(FLIGHT_DEPARTURE_FROM),
+        "date_to": format_tequila_date(FLIGHT_DEPARTURE_TO),
+        "nights_in_dst_from": FLIGHT_STAY_NIGHTS,
+        "nights_in_dst_to": FLIGHT_STAY_NIGHTS,
+        "flight_type": "round",
+        "max_stopovers": 0,
+        "curr": FLIGHT_CURRENCY,
+        "limit": FLIGHT_MAX_RESULTS,
+        "sort": "price",
+        "vehicle_type": "aircraft",
+    }
+    headers = {"apikey": TEQUILA_API_KEY}
+
+    try:
+        resp = requests.get(
+            TEQUILA_SEARCH_URL,
+            params=params,
+            headers=headers | REQUEST_HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        return []
+    except ValueError:
+        return []
+
+    return [
+        normalize_flight_item(item, origin, destination)
+        for item in data.get("data", [])
+        if item.get("price") is not None
+    ]
+
+
+def collect_direct_flight_deals() -> tuple[list[dict], list[dict], dict]:
+    origins = parse_labeled_code_list(FLIGHT_ORIGINS_TEXT)
+    destination = parse_destination(FLIGHT_DESTINATION_TEXT)
+    deals = []
+
+    if TRAVELPAYOUTS_TOKEN:
+        for origin in origins:
+            deals.extend(fetch_travelpayouts_direct_flight_deals_for_origin(origin, destination))
+    elif TEQUILA_API_KEY:
+        for origin in origins:
+            deals.extend(fetch_direct_flight_deals_for_origin(origin, destination))
+
+    deals.sort(
+        key=lambda item: item.get(
+            "price_value",
+            parse_dkk_price(str(item.get("price", ""))),
+        )
+    )
+    return deals[:FLIGHT_MAX_RESULTS], origins, destination
+
+
+def format_flight_deal(item: dict) -> str:
+    departure = format_flight_date(item["departure"]) or "日期未知"
+    return_departure = format_flight_date(item["return_departure"]) or "返程未知"
+    price_text = f"{item['price']} {item['currency']}"
+    provider_text = f"，{item['provider']}" if item.get("provider") else ""
+    return (
+        f"- {item['origin']['label']}({item['origin']['code']}) → "
+        f"{item['destination']['label']}({item['destination']['code']})："
+        f"{price_text}，{departure} 出发，{return_departure} 返程，"
+        f"{item['nights']}晚，{item['airlines']}{provider_text}"
+    )
+
+
+def format_flight_watch_section_text() -> str:
+    if not FLIGHT_WATCH_ENABLED:
+        return ""
+
+    deals, origins, destination = collect_direct_flight_deals()
+    route_text = " / ".join(f"{origin['label']}({origin['code']})" for origin in origins)
+    lines = [
+        "直飞迪拜低价航班观察：",
+        (
+            f"规则：枚举 {FLIGHT_DEPARTURE_FROM} 至 {FLIGHT_DEPARTURE_TO} 的每个出发日，"
+            f"返程固定 +{FLIGHT_STAY_NIGHTS}晚；{route_text} → "
+            f"{destination['label']}({destination['code']})；仅直飞；按价格排序。"
+        ),
+    ]
+
+    if (
+        not TRAVELPAYOUTS_TOKEN
+        and not TEQUILA_API_KEY
+    ):
+        lines.append(
+            "- 未配置免费航班 API 凭证，暂不自动记录实时价格；"
+            "推荐配置 TRAVELPAYOUTS_TOKEN 后使用 Aviasales 缓存价自动筛选最低价。"
+        )
+        for origin in origins:
+            lines.append(
+                f"  {origin['label']}({origin['code']}) 查询："
+                f"{build_flight_search_url(origin, destination)}"
+            )
+        return "\n".join(lines)
+
+    if not deals:
+        if TRAVELPAYOUTS_TOKEN:
+            provider_hint = "Travelpayouts/Aviasales 缓存价"
+        else:
+            provider_hint = "Kiwi Tequila"
+        lines.append(
+            f"- {provider_hint} 暂未抓到符合条件的直飞低价结果；"
+            "建议放宽日期，或同步查 DWC。"
+        )
+        for origin in origins:
+            lines.append(
+                f"  {origin['label']}({origin['code']}) 手动查："
+                f"{build_flight_search_url(origin, destination)}"
+            )
+        return "\n".join(lines)
+
+    lines.append("当前低价：")
+    for item in deals:
+        lines.append(format_flight_deal(item))
+        if item.get("booking_url"):
+            lines.append(f"  链接：{item['booking_url']}")
+    return "\n".join(lines)
+
+
 def format_student_life_section_text(
     now: datetime,
     current: dict,
@@ -1348,7 +1702,7 @@ def format_daily_report_text() -> str:
     wind_speed = current.get("wind_speed_10m")
     holiday_text = get_holiday_text(date_str)
     life_section = format_student_life_section_text(dt, current, holiday_text)
-    news_section = format_news_section_text()
+    flight_section = format_flight_watch_section_text()
 
     base_text = (
         f"哥本哈根每日播报\n"
@@ -1361,7 +1715,8 @@ def format_daily_report_text() -> str:
     sections = [base_text]
     if life_section:
         sections.append(life_section)
-    sections.append(news_section)
+    if flight_section:
+        sections.append(flight_section)
     return "\n\n".join(sections)
 
 
