@@ -2,8 +2,8 @@ name: Daily Copenhagen Push
 
 on:
   schedule:
-    # 08:00 Copenhagen time corresponds to 14:00 Beijing time during CEST (UTC+2).
-    - cron: "0 6 * * *"
+    # 08:00 Beijing time (UTC+8) corresponds to 00:00 UTC.
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
